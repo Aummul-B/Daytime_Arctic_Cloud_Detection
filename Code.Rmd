@@ -1,0 +1,784 @@
+---
+title: "Lab 4 - Cloud Data Stat 215A, Fall 2018"
+author: "Aummul Baneen Manasawala, Yuchen Zhang, Lei Zhang"
+date: "11/08/2018"
+header-includes:
+   - \usepackage{float}
+   - \DeclareUnicodeCharacter{2212}{-}
+output: 
+  pdf_document:
+    number_sections: true
+---
+
+# Introduction
+The goal of this group project is the exploration and modeling of cloud detection in the polar regions based on radiances recorded automatically by the MISR sensor aboard the NASA satellite Terra. We attempt to build several prediction models to distinguish cloud from non-cloud using the available signals. The dataset we have are three image data with expert label (+1 = cloud, -1 = not cloud, 0 unlabeled), three features based on subject matter knowledge (NDAI, SD, CORR), and five multi-angel sensor data (Radiance angle DF, CF, BF, AF, AN). Finally our best fit model will be used to distinguish clouds from non-clouds on a large number of images that won’t have these expert labels.
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Load in useful packages
+library(tidyverse)
+library(gridExtra)
+library(knitr)
+library(pander)
+library(corrplot)
+library(e1071)
+library(caret)
+library(rpart.plot)
+library(ROCR)
+library(randomForest)
+library(reshape2)
+library(leaps)
+library(ggvis)
+library(party)
+library(class)
+library(neuralnet)
+
+# Get the data for three images
+path <- "image_data/"
+image1 <- read.table(paste0(path, 'image1.txt'), header = F)
+image2 <- read.table(paste0(path, 'image2.txt'), header = F)
+image3 <- read.table(paste0(path, 'image3.txt'), header = F)
+
+# Add informative column names.
+collabs <- c('y','x','label','NDAI','SD','CORR','DF','CF','BF','AF','AN')
+names(image1) <- collabs
+names(image2) <- collabs
+names(image3) <- collabs
+
+
+
+# Combine the three image datasets
+image <- rbind(image1, image2, image3)
+
+
+#Adding a column for image number
+image1$image <- "Image 1"
+image2$image <- "Image 2"
+image3$image <- "Image 3"
+
+
+image_labelled <- rbind(image1, image2, image3)
+
+
+# Remove unlabeled data (label=0) and change not cloud from -1 to 0
+image <- image[image$label != 0,]
+image$label[image$label == -1] <- 0
+image$label <- factor(image$label)
+
+image_labelled <- image_labelled[image_labelled$label != 0,]
+image_labelled$label[image_labelled$label == -1] <- "No cloud"
+image_labelled$label[image_labelled$label == 1] <- "Cloud"
+image_labelled$label <- factor(image_labelled$label)
+
+```
+
+
+# EDA
+In order to explore the given data, we start with visulaizing the images and areas which have been labeled as having clouds or not by the experts as can be seen in figure \ref{fig:eda1}. In order to see the relationship between the preence of clouds and the features, we plot the values of features on the same grid too. We find that the strong connection between the presence/absence of cloud in figure \ref{fig:eda1} and the distribution of NDAI values in figure \ref{fig:eda2} is visually apparent. Therefore from these alone we can conclude that NDAI is a prominent feature that could strongly predict the clouds in our model.
+
+We further explore the relationships between the radiances of different angles visually which could be summarized with the boxplots in figure \ref{fig:eda3}. Along with the relationships of different angles with is strong and positive, for our model it is important to know how are all the features related to the label as well as each other. From figure \ref{fig:eda4}, we can see that only NDAI, SD and CORR features are positively and significantly correlated to the expert label of whether the clouds are present (numeric 0 or 1). For the five angles we can deduce that higher are those angles, lower is the probability of clouds presence. This substantiates the fact that the radiances from MISR detection have larger variance due to the physical presence of cloud. Absence of cloud make the standard deviation of the each of the randiance angles quite small. This could corroborated visually in figure \ref{fig:eda5}.
+
+```{r eda1, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=4, fig.width=12, fig.align="center", fig.cap = "Visualizing the pattern of clouds in the three images using expert labels. ", fig.pos="H"}
+# Plot the expert pixel-level classification
+ggplot(image_labelled) + 
+  geom_point(aes(x = x, y = y, color = factor(label))) +
+  scale_color_discrete(name = "Expert label") + theme_bw() + 
+  theme(panel.grid = element_line(size = 0)) + facet_grid(.~image)
+
+```
+
+
+```{r eda2, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=4, fig.width=12, fig.align="center", fig.cap = "Visulaizing the distribution of NDAI values in the images", fig.pos="H"}
+
+#Plotting NDAI values
+ggplot(image_labelled) + 
+  geom_point(aes(x = x, y = y, color = NDAI), alpha = 0.1) + theme_bw() +
+  scale_color_gradientn(colours = rainbow(5)) + 
+  theme(panel.grid = element_line(size = 0)) + facet_grid(.~image)
+
+```
+
+```{r eda3, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=3, fig.width=12, fig.align="center", fig.cap = "Relationship between the radiances of different angles", fig.pos="H"}
+require(reshape2)
+ggplot(data = melt(image[ ,c(7:11)]), aes(x=variable, y=value)) + geom_boxplot(aes(fill=variable)) + theme_bw()
+```
+
+
+```{r eda4, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=3, fig.width=12, fig.align="center", fig.cap = "Quantitative relationship between the features", fig.pos="H"}
+image_num <- image
+image_num$label <- as.numeric(image_num$label)
+corr <- cor(image_num[ , c(3:11)])
+corrplot(corr, method = c("color"), addCoef.col = "black", tl.srt=45, type = "full", sig.level = 0.01, insig = "blank", tl.cex = 0.7, cl.cex = 0.7, number.cex = 0.7)
+
+```
+
+```{r eda5, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=5, fig.width=12, fig.align="center", fig.cap = "Difference between the feature distribution due to presence of clouds", fig.pos="H"}
+
+all <- melt(image_labelled[, c(3:11)], id.vars = 'label', variable.name = "Feature")
+
+ggplot(data = all) +
+  geom_density(aes(x = value, group = factor(label), fill = factor(label)), 
+               alpha = 0.5) +
+  scale_fill_discrete(name = "Expert label") + facet_wrap(Feature~., scales = "free") 
+
+```
+
+#Feature Selection
+We estimate the minimum number of features that can make a good model to avoid the curse of dimensionality along with enhancing the interpretability of our models. To do so, we take two approaches. First we choose among a set of models of different sizes using Cp, BIC, and adjustedR2. Second, we consider doing it using the validation set and cross-validation approaches.
+
+In the first approach, we use regression and compare the R square value of models with various number of features. We can safely use linear regression because for binary 0-1, linear regression is a pretty good approximation for logistic regression and gives an adequate classification. In the second, we split the observations in training and test set and obtain the best subset selection for each candidate model with particular number of prediction variables. Then, we extract the coefficients for the best model of that size, calculate the predictions, and compute the test mean square error(MSE). In both cases as seen in figure \ref{fig:fs1}, we get an elbow at 3 which means that major variability is explained by 3 variables and adding additional variables in the model donot add significantly much to improve the model.
+
+```{r fs1, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=4, fig.width=12, fig.align="center", fig.cap = "Selecting the number of features in the model using regression R square (left) and cross validation MSE (right)", fig.pos="H"}
+
+#First Method 
+regfit.full = regsubsets(label ~ ., data = image_num, nvmax = 9)
+reg.summary = summary(regfit.full)
+
+#plot r^2
+rsq <- as.data.frame(reg.summary$rsq)
+names(rsq) <- "R2"
+
+p1 <- ggplot(data = rsq) + geom_point(aes(x = c(1:nrow(rsq)), y = R2)) + geom_line(aes(x = c(1:nrow(rsq)), y = R2)) + xlab("Number of Variables") + ylab("R2") + theme_bw() + geom_vline(xintercept=3, linetype="dotdash")
+
+
+
+#Second Method
+set.seed (7)
+train = sample(c(TRUE,FALSE), nrow(image_num),rep=TRUE)
+test =(! train )
+regfit.best = regsubsets(label~., data=image_num[train,], nvmax =11)
+test.mat = model.matrix(label ~., data=image_num[test,])
+#calculating and storing MSE
+val.errors = rep(NA,8)
+for (i in 1:8){
+        coefi = coef(regfit.best, id=i)
+        pred = test.mat[,names(coefi)]%*%coefi
+        val.errors[i] = mean((image_num$label[test]-pred)^2)
+}
+#plotting MSE
+verr <- as.data.frame(val.errors);  names(verr) <- "err"
+index <- c(1:nrow(verr))
+verr <- cbind.data.frame(verr,index)
+
+
+
+p2 <- ggplot(data = verr) + geom_point(aes(x = index, y = err))+
+  geom_line(aes(x = index, y = err)) + xlab("Number of variables") + ylab("MSE from Cross Validation") + theme_bw() + geom_vline(xintercept=3, linetype="dotdash")
+
+grid.arrange(p1, p2, nrow = 1)
+
+```
+
+
+For the purpose of selecting the features we employ two methods, best subset method in regression using BIC and Cp and random forest method to select features. We find that NDAI, CORR and SD are the best features to be incorporated in the models. We donot strictly model with only these three until and unless we have computational limitation or interpretability issue.
+
+```{r fs2, eval=FALSE, message=FALSE, warning=FALSE, cache = TRUE, include=FALSE}
+#Regression Method BIC and Cp to select features
+p1 <- plot(regfit.full,scale="bic")
+p2 <- plot(regfit.full, scale = "Cp")
+
+#Random Forest Method to select features
+cf1 <- cforest(label ~ . , data= image_num, control=cforest_unbiased(mtry=2,ntree=50)) # fit the random forest
+varimp(cf1) # get variable importance, based on mean decrease in accuracy
+
+grid.arrange(p1, p2, nrow = 2)
+```
+
+
+
+# Classification Models
+
+Before we do modeling, we first check the data quality. There is no missing value for the three image datasets. First, we combine the three image data together, remove the unlabeled data (about 40% of the data are unlabeled) and convert the label to categorical data (+1 = cloud, 0 = not cloud). Then we split the total image data into training (80%) and test (20%) set. We use the 80% training data to train our models, the six classification models we choose are Logistic regression, KNN, Decision Tree, Random Forest, Support Vector Machines, and Neural Networks. We apply cross-validation for hyperparameter optimization, then use one specific model for each kind on 20% testing set and get the prediction results. Finally we compare the six models' confusion matrix and ROC curve to select the best fit model.
+
+
+```{r model-split, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Split image data into training and testing set
+set.seed(123)
+ind <- sample(seq_len(nrow(image)), size = floor(0.80 * nrow(image)))
+training <- image[ind, -c(1:2)]
+test <- image[-ind, -c(1,2)]
+training_sub <- training[ ,c(1:4)]
+
+```
+
+
+## Logistic Regression
+
+We apply logistic regresion to the two models : first with all the features and second with only the three best features obtained which contribute the most to the deviations from the ANOVA test. We denote their AIC scores as $AIC_1$ and $AIC_2$ respectively. The second model($AIC_2$ = 92788) is exp((88437−92788)/2) = 0 times as probable as the first model($AIC_1$ = 88437) to minimize the information loss. Therefore, we drop the second model from consideration.
+
+To evaluate the performance of the model, we calculate the accuracy and plot the ROC curve. The logistic model gives 89% accuracy and the AUC for the ROC curve turns out to be 0.9544.
+
+```{r LR_model, message=FALSE, warning=FALSE, cache=TRUE, include=FALSE}
+#Choosing from the two models
+model1 <- glm(label~.,family=binomial(link='logit'),data=training)
+model2 <- glm(label~.,family=binomial(link='logit'),data=training_sub)
+
+summary(model1)
+summary(model2)
+
+anova(model1, test = "Chisq")
+
+model_lr <- model1
+```
+
+
+```{r LR_eval, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+
+#Assessing the predictive ability of the model
+fitted.results <- predict(model_lr,newdata=subset(test,select=c(2,3,4,5,6,7,8, 9)),type='response')
+fitted.results <- ifelse(fitted.results > 0.5,1,0)
+misClasificError <- mean(fitted.results != test$label)
+print(paste('Accuracy of logistic regression:',1-misClasificError))
+
+#ROC Curve for comparision
+p <- predict(model_lr, newdata=subset(test,select=c(2,3,4,5,6,7,8,9)), type="response")
+pr <- ROCR::prediction(p, test$label)
+prf <- ROCR::performance(pr, measure = "tpr", x.measure = "fpr")
+# plot(prf)
+
+auc <- ROCR::performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+
+```
+
+```{r LR_eval2, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+
+# Check accuracy
+CM_lr <- confusionMatrix(data=as.factor(fitted.results), reference=test$label, positive="1")
+
+pander(ftable(CM_lr$table), caption = paste("Confusion Matrix of Logistic Regression"))
+
+```
+
+
+
+## KNN
+
+k nearest neighbors is a simple algorithm that stores all available cases and classifies new cases by a majority vote of its k neighbors. Since the independent variables in training data are measured in different units, it is important to standardize variables in order to have the distances that are comparable for each variable. To obtain the best value for k, 10-fold validations is used as our data is in the order of 100,000 and 10 fold validation would have 10,000 data points for the test case which is sufficient for reliably test our model. As can be seen from the result, the best number of neigbours to use for our knn should be 5 to give us the most accurate results.
+
+We find that application of knn model with k as '5' on the training data set gives us a model that is accurate 95.7%. This is quite good accuracy and the ROC curve yeilds a AUC of 0.955 makes knn as our serious prospect.  
+
+```{r knn, eval=FALSE, fig.align="center", fig.cap="Tuning Hyperparameter 'k' for KNN through cross validation", fig.height=5, fig.pos="H", fig.width=12, message=FALSE, warning=FALSE, cache=TRUE, include=FALSE}
+
+# 10-fold cross validation to choose the best k
+# Fit the model on the training set
+set.seed(123)
+model_knn <- train(
+  label ~., data = training, method = "knn",
+  trControl = trainControl("cv", number = 10),
+  preProcess = c("center","scale"),
+  tuneLength = 10
+  )
+
+# Plot model accuracy vs different values of k
+plot(model_knn, xlab = "Number of Neighbors")
+
+# The best tuning parameter k that
+# maximizes model accuracy
+model_knn$bestTune
+
+# Make predictions on the test data
+predicted.classes <- model_knn %>% predict(test[2:9])
+head(predicted.classes)
+
+
+# Compute model accuracy rate
+mean(predicted.classes == test$label)
+
+
+#ROC Curve for comparision
+p <- predict(model_knn, newdata=subset(test,select=c(2,3,4,5,6,7,8,9)), type="response")
+pr <- prediction(as.numeric(predicted.classes), test$label)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+# plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+
+
+# Check accuracy
+CM_knn <- confusionMatrix(data=as.factor(predicted.classes), reference=test$label, positive="1")
+
+pander(ftable(CM_knn$table), caption = paste("Confusion Matrix of KNN"))
+```
+
+
+```{r knn2, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# train the model with k = 5
+knn.5 <- knn(training[,c(2:9)], test[,c(2:9)], training[, 1], k=5)
+# calculate the accuracy 
+print(paste('Accuracy of knn:', mean(knn.5 == test$label))) 
+
+```
+
+
+```{r knn_cm, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+
+CM_knn <- confusionMatrix(data=knn.5, reference=test$label, positive="1")
+pander(ftable(CM_knn$table), caption = paste("Confusion Matrix of KNN"))
+
+```
+
+
+
+## Decision Tree
+
+Decision tree is a supervised graph based algorithm to represent choices and the results of the choices in the form of a tree. The nodes in the graph represent an event or choice and it is referred to as a leaf and the set of decisions made at the node is reffered to as branches. Decision Tree is robust to noisy data, useful in data exploration, and its non parametric quality means it does not have any assumptions about the distribution of the variables. However one common disadvantage of decision tree is overfitting, and it is taken care of partially by constraining the model parameter and by prunning. There are many ways to measure the impurity and decide the split points, here I use Information Gain and Gini Index.
+
+### DT - Criterion as Information Gain
+
+I use criterion as Information Gain for this decision tree model. I apply 10 fold corss-validation and repeated 3 times on the training set. Table 3 is the resampling results across tuning parameters. The complexity parameter (cp) is used to control the size of the decision tree and to select the optimal tree size. If the cost of adding another variable to the decision tree from the current node is above the value of cp, then tree building does not continue. Accuracy is used to select the optimal model using the largest value, therefore the final value used for the model was cp = 0.0010196.
+
+```{r DT, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Split image data into training and testing set
+set.seed(123)
+ind <- sample(seq_len(nrow(image)), size = floor(0.80 * nrow(image)))
+training <- image[ind, -c(1:2)]
+test <- image[-ind, -c(1,2)]
+
+# Train the decision tree classifier with criterion as INFORMATION GAIN
+trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+set.seed(123)
+dtree_fit_info <- train(label ~ ., data = training, method = "rpart",
+                   parms = list(split = "information"),
+                   trControl=trctrl,
+                   tuneLength = 10)
+
+kable(dtree_fit_info$results,
+      caption = paste("Trained Decision Tree classifier results"))
+```
+
+Figure \ref{fig:DT2} is the visualization of my final decision tree after cross-validation. The color of the leafs shows the impurity of split and the class, the % shows the percent of data falls in this branch. We can see that the first split is NDAI < 0.66. The more dark red and more white of our leafs indicates our splits are more pure. 
+
+```{r DT2, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=5, fig.width=12, fig.align="center", fig.cap = "Plot of Decision Tree", fig.pos = "H"}
+# Plotting the decision tress
+prp(dtree_fit_info$finalModel, box.palette = "Reds", extra = "auto")
+
+```
+
+Now I predict target variable for the test set using my final trained moded with cp = 0.0010196. Table 4 is the confusion matrix used to describe the performance of this classifier, including actual and predicted value, for example 15685 cloudy and 22708 non-cloudy points are predicted correcly. More detailed valuation (accuracy, precision, recall, ROC) will be shown in the comparison part.
+
+```{r DT3, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Prediction
+test_pred_info <- predict(dtree_fit_info, newdata = test)
+
+# Check accuracy
+CM_info <- confusionMatrix(data=test_pred_info, reference=test$label, positive="1")
+
+pander(ftable(CM_info$table), caption = paste("Confusion Matrix of Decision Tree (Infomation Gain)"))
+
+```
+
+
+
+### DT - Criterion as Gini Index
+
+I use criterion as Gini Index for this decision tree model, the other parameters remain the same. I use cross-validated (10 fold, repeated 3 times) resampling method, the final model with largest accuracy is when cp = 0.0010196, which is exactly the same as Information Gain method. Table 5 shows the confusion mateix of Gini Index Decision Tree.
+
+```{r DT4, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Train the decision tree classifier with criterion as INFORMATION GAIN
+trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+set.seed(123)
+dtree_fit_gini <- train(label ~., data = training, method = "rpart",
+                   parms = list(split = "gini"),
+                   trControl=trctrl,
+                   tuneLength = 10)
+
+# kable(dtree_fit_gini$results, caption = paste("Trained Decision Tree classifier results"))
+```
+
+
+```{r DT5, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=5, fig.width=12, fig.align="center", fig.cap = "Plot of Decision Tree", fig.pos = "H"}
+# Plotting the decision tress
+# prp(dtree_fit_gini$finalModel, box.palette = "Blues", extra = "auto")
+
+```
+
+
+```{r DT6, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Prediction
+test_pred_gini <- predict(dtree_fit_gini, newdata = test)
+
+# Check accuracy
+CM_gini <- confusionMatrix(data=test_pred_gini, reference=test$label, positive="1")
+
+pander(ftable(CM_gini$table), caption = paste("Confusion Matrix of Decision Tree (Gini Index)"))
+
+```
+
+
+## Random Forest
+
+Random Forest is a ensemble learning method that combines multiple trees as opposed to a single decision tree to form a powerful model. In the process it reduces dimensionality, removes outliers and treats missing values. Here we build 500 decision trees using Random Forest. Figure \ref{fig:RF} shows the plot of error rate across decision trees. The plot seems to indicate that after 200 decision trees, there is not a significant reduction in error rate.
+
+
+```{r RF, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=4, fig.width=5, fig.align="center", fig.cap = "Plot of Random Forest", fig.pos = "H"}
+# Building Random Forest model
+rf_fit <- randomForest(label ~., training, ntree=500, importance=T)
+plot(rf_fit, cex.lab = 0.7, cex.axis = 0.7, main = NULL)
+
+```
+
+Figure \ref{fig:RF2} is variable importance plot. Top 5 variables are selected and plotted based on Model Accuracy and Gini value (node impurity). We find that first three features are fixed for two methods, which are NDAI, SD, CORR in feature importance descending order. Table 6 shows the confusion matrix of random forest algorithm on test data. The corrected classified region points increase a little compared with two decision tree models.
+
+```{r RF2, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=4, fig.width=8, fig.align="center", fig.cap = "Variable Importance Plot for Random Forest", fig.pos = "H"}
+# Variable importance plot
+randomForest::varImpPlot(rf_fit,
+           sort = T,
+           main = NULL,
+           n.var = 5)
+
+```
+
+
+```{r RF3, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+## Prediction
+test_pred_rf <- predict(rf_fit, test)
+
+## Confusion matrix
+CM_rf <- confusionMatrix(data=test_pred_rf, reference=test$label, positive="1")
+
+pander(ftable(CM_rf$table), caption = paste("Confusion Matrix of Random Forest"))
+
+```
+
+
+
+## Support Vector Machine
+
+Support Vector Machines (SVMs) is a data classification method that separates data using hyperplanes. One observation about classification is that in the end, if we only care about assigning each data point a class, all we really need to know do is find a "good" decision boundary, and we can skip thinking about the distributions. Support Vector Machines (SVMs) are an attempt to model decision boundaries directly in this spirit.
+
+If we have labeled data with dimension $d$, SVMs can be used to generate $d-1$ dimensional hyperplanes such that the data space is divided into segments and each segment contains only one kind of data. 
+
+Due to the very high computational power requirement, it is not realistic to run cross validation or using the whole dataset. Here I randomly sample $10000$ data points as the training set and another $2000$ points as the test set to explore the performance of SVMs.
+ 
+```{r DataSplit, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+##split into training, validation and test sets
+training_size <- 10000
+test_size <- 2000
+set.seed(0)
+sample_index <- sample(dim(image)[1], (training_size + test_size))
+
+
+training_valid_index <- sample_index[1:training_size]
+test_index <- sample_index[(training_size + 1):length(sample_index)]
+
+training_valid_data <- image[training_valid_index,3:6]
+test_data <- image[test_index,3:6]
+
+```
+
+
+```{r SVM, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+library(e1071)
+
+SVM_model <- svm(label~., data = training_valid_data, type = "C-classification")
+SVM_model2 <- svm(label~., data = training_valid_data, type = "C-classification", probability = TRUE)
+
+SVM_pred <- predict(SVM_model,test_data, decision.values = TRUE)
+SVM_pred2 <- predict(SVM_model2,test_data, decision.values = TRUE, probability = TRUE)
+
+# Check accuracy using confusion matrix
+CM_SVM <- confusionMatrix(data = SVM_pred, reference = factor(image[test_index,'label']), positive = "1")
+
+pander(ftable(CM_SVM$table), caption = paste("Confusion Matrix of SVM"))
+
+# calculate the accuracy 
+print(paste('Accuracy of SVM:', mean(SVM_pred == test_data$label))) 
+
+```
+
+
+## Neural Networks
+
+The basic idea of a neural network is that we are going to Combine input information in a complex & flexible
+neural net "model". Model "coefficients"" are continually tweaked in an
+iterative process. The network??s interim performance in classification
+and prediction informs successive tweaks.
+
+A neural network consisits of three layers:
+1.  Input layers: Layers that take inputs based on exising data
+2.  Hidden layers: Layers that use backpropagation to optimize the weights of the input variables in order to improve the predictive power of the model.
+3.  Output layers: Output of predictions based on the data from the input and hidden layers.
+
+There is no model assumption for neural network. But a neural network has a high requirement for computaion power. Again, it is not realistic to run cross validation or using the whole dataset. So I used the same dataset in the SVMs part to run the neural network and evaluate its performance.
+
+One of the most impotant procdures when forming a neural network is data normalization. This has been done in the very first step of data restructuring.
+
+```{r NN,echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=6, fig.width=12, fig.align="center", fig.cap = "Plot of Neural Network", fig.pos = "H"}
+library(neuralnet)
+#split into test and training sets
+# k <- 1
+# cv_index <- seq(((k-1)*fold_size + 1), k*fold_size,1)
+# training_index <- training_valid_index[cv_index]
+# validation_index <- training_valid_index[-cv_index]
+
+
+#scale the data
+training_valid_data_nn <- training_valid_data %>% 
+  mutate(label = ifelse(label == 1, TRUE, FALSE)) %>%
+  mutate(NDAI = scale(NDAI), SD = scale(SD), CORR = scale(CORR))
+
+test_data_nn <- test_data %>% mutate(label = ifelse(label == 1, TRUE, FALSE))%>%
+  mutate(NDAI = scale(NDAI), SD = scale(SD), CORR = scale(CORR))
+
+#run neural network with hidden layer = 3
+NN = neuralnet(label~ NDAI 
+               + SD + CORR, data = training_valid_data_nn, hidden = 3, likelihood = TRUE)
+
+#plot the neural network graph
+plot(NN)
+
+#AIC,BIC
+NN_AIC <- NN$result.matrix[4,1]
+print(paste('AIC of Neural Networks:', NN_AIC))
+NN_BIC <- NN$result.matrix[5,1]
+print(paste('BIC of Neural Networks:', NN_BIC))
+
+#prediction using neural network
+NN_pred <- compute(NN, test_data_nn[,2:4])
+NN_pred_prob <- NN_pred$net.result
+NN_pred_result <- ifelse(NN_pred_prob > 0.5, 1, 0)
+
+
+#Confustion matrix
+#rewrite the test_data$label to generate the confusion matrix
+test_data_nn$label <- ifelse(test_data_nn$label == TRUE, 1, 0)
+test_data_nn$label <- factor(test_data_nn$label)
+CM_NN <- confusionMatrix(data=factor((NN_pred_result)),reference =factor(test_data$label),positive="1")
+
+pander(ftable(CM_NN$table), caption = "Confusion Matrix of Neural Network")
+
+# calculate the accuracy 
+print(paste('Accuracy of Neural Networks:', mean(NN_pred_result == test_data_nn$label)))
+
+```
+
+
+## Model Comparison
+
+After applying different classification algorithms, we find that some of the features might be better predictors of the presence of clouds than others. Table 7 shows the feature importance for different models, DT is scaled to 100 and RF is not. We find that the three of the best features are NDAI, SD and CORR for all of the algorithm models, followed by two radiance angel AN and AF, the rest three angel are far less important.
+
+```{r COM, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Feature Impotrance
+
+# feature importance for DT - Info
+varimp_info <- varImp(dtree_fit_info)$importance
+varimp_info <- cbind(row.names(varimp_info), varimp_info)
+names(varimp_info) <- c("Vars", "DT_Info")
+
+# feature importance for DT - Gini
+varimp_gini <- varImp(dtree_fit_gini)$importance
+varimp_gini <- cbind(row.names(varimp_gini), varimp_gini)
+names(varimp_gini) <- c("Vars", "DT_Gini")
+
+# feature importance for RF
+varimp_rf <- data.frame(randomForest::importance(rf_fit, type=2))
+varimp_rf <- cbind(row.names(varimp_rf), varimp_rf)
+names(varimp_rf) <- c("Vars", "RF")
+
+# combine the importance data together and sort by info
+varimp <- merge(varimp_info, varimp_gini, by = "Vars")
+varimp <- merge(varimp, varimp_rf, by = "Vars")
+varimp <- varimp[order(varimp$DT_Info, decreasing = T),]
+rownames(varimp) <- NULL
+
+kable(varimp,
+      caption = paste("Comparision of Feature Importance"))
+
+```
+
+In order to choose the best fit model, model evaluation is done based on testing dataset. Table 8 shows the detailed measures in confusion matrix, eg. $accuracy = \frac{TP+TN}{P+N}$, $sensitivity = racall = \frac{TP}{P}$, $specificity = \frac{TN}{N}$, $precision = \frac{TP}{TP+FP}$. Random forest has higher accuracy compared with single decision tree model. Figure \ref{fig:COM3} shows the ROC curve for different models, the larger the area (AUC), the better the performance. The balanced accuracy for DT-Info, DT-Gini, RF, logistic, Knn, SVM and Neural Networks are 0.930, 0.929, 0.963, 0.885, 0.928, 0.926 and 0.918 respectively. In conclusion, we choose random forest as our best classification model.
+
+```{r COM2, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+# Confusion Matrix
+CM <- data.frame(CM_info$byClass)
+names(CM) <- "DT_Info"
+CM$DT_Gini <- CM_gini$byClass
+CM$RF <- CM_rf$byClass
+CM$Logit <- CM_lr$byClass
+CM$Knn <- CM_knn$byClass
+CM$SVM <- CM_SVM$byClass
+CM$NN <- CM_NN$byClass
+kable(CM, format.args = list(digits = 3),
+      caption = paste("Comparision of Confusion Matrix"))
+
+```
+
+
+
+```{r COM3, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=5, fig.width=5, fig.align="center", fig.cap = "Test Set ROC Curves", fig.pos = "H"}
+# ROC curve
+# List of predictions
+pred_info <- predict(dtree_fit_info, test, type = "prob")[,2]
+pred_gini <- predict(dtree_fit_gini, test, type = "prob")[,2]
+pred_rf <- predict(rf_fit, test, type = "prob")[,2]
+pred_logit <- predict(model_lr, test[, c(2:9)], type = "response")
+pred_knn <- knn(training[,c(2:9)], test[,c(2:9)], training[, 1], k=5, prob = TRUE)
+pred_svm <- attr(SVM_pred2,"probabilities")[,2]
+pred_nn <- as.numeric(NN_pred_prob)
+preds_list <- list(pred_info, pred_gini, pred_rf, 
+                   pred_logit, pred_knn, pred_svm, pred_nn)
+
+# List of actual values (same for all)
+m <- length(preds_list)
+actuals_list <- list(test$label,test$label,test$label,test$label,
+                     test$label,test_data$label, test_data_nn$label)
+
+# Plot the ROC curves
+pred <- ROCR::prediction(preds_list, actuals_list)
+rocs <- performance(pred, "tpr", "fpr")
+plot(rocs, col = as.list(1:m))
+abline(0, 1, lty = 2)
+legend(x = "bottomright", 
+       legend = c("Decision Tree (Info)", "Decision Tree (Gini)", "Random Forest",
+                  "Logistic", "Knn", "SVM", "Neural Networks"),
+       fill = 1:m, cex = 0.75)
+
+```
+
+
+
+# Performance of Best Model
+
+## Misclassification Patterns
+
+In this part, we choose our best-performance model "Random Forest" to do the misclassification Analysis. Based on the predicted labels from Random Forest, we figure out there are 1599 observations in the test dataset are misclassified. And 1128 observations are false positive, while 471 observations are false negative. This indicates a higher probability for misclassifying ice area to cloud than misclassifying cloud to ice area. 
+
+We then take out all the covariates of these misclassified observations and compare them with the correctly-labeled ones.
+
+Based on two sample t-tests, when compared with correctly-labeled observations, the misclassified observations have higher NDAI, SD and lower DF, CF, BF, AF, AN with p-value less than e-16. CORR doesn't seem to have relationship with the misclassification.
+
+We also include the visualization of misclassified points in the analysis.
+
+
+
+```{r Misclassification1,echo=FALSE, fig=TRUE,  message=FALSE, warning=FALSE, cache = TRUE, fig.height=4, fig.width=12, fig.align="center", fig.pos = "H"}
+#summary(test[test$label!= test_pred_rf,c('NDAI', 'SD','CORR', 'DF', 'CF', 'BF', 'AF', 'AN')])
+
+
+#summary(test[test$label == test_pred_rf,c('NDAI', 'SD','CORR', 'DF', 'CF', 'BF', 'AF', 'AN')])
+
+
+#t.test(test[test$label != test_pred_rf,'NDAI'], test[test$label == test_pred_rf,'NDAI'], alternative = "greater",var.equal = FALSE)
+#significant
+
+#t.test(test[test$label != test_pred_rf,'SD'], test[test$label == test_pred_rf,'SD'], alternative = "greater",var.equal = FALSE)
+#significant
+
+
+#t.test(test[test$label != test_pred_rf,'CORR'], test[test$label == test_pred_rf,'CORR'], alternative = "two.sided",var.equal = FALSE)
+#not significant
+
+
+#t.test(test[test$label != test_pred_rf,'DF'], test[test$label == test_pred_rf,'DF'], alternative = "less",var.equal = FALSE)
+#significant
+
+#t.test(test[test$label != test_pred_rf,'CF'], test[test$label == test_pred_rf,'CF'], alternative = "less",var.equal = FALSE)
+
+
+#t.test(test[test$label != test_pred_rf,'BF'], test[test$label == test_pred_rf,'BF'], alternative = "less",var.equal = FALSE)
+
+#t.test(test[test$label != test_pred_rf,'AF'], test[test$label == test_pred_rf,'AF'], alternative = "less",var.equal = FALSE)
+
+
+#t.test(test[test$label != test_pred_rf,'AN'], test[test$label == test_pred_rf,'AN'], alternative = "less",var.equal = FALSE)
+
+
+#figure out the location of misclassified area
+loc_data <- image[-ind,]
+loc_data_misclassification <-  loc_data[test$label!= test_pred_rf,]
+loc_data_misclassification$image <- image_labelled[-ind,'image'][test$label!= test_pred_rf]
+                                        
+blank_theme <-
+  theme_bw() +
+  theme(plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank())                                         
+
+p_mis1 <- ggplot(loc_data_misclassification[loc_data_misclassification$image == "Image 1",], aes(x = x, y = y)) + 
+  geom_point() + 
+  ggtitle("Misclassified points in image1") + 
+  blank_theme
+
+p_mis2 <- ggplot(loc_data_misclassification[loc_data_misclassification$image == "Image 2",], aes(x = x, y = y)) + 
+  geom_point() + 
+  ggtitle("Misclassified points in image2") + 
+  blank_theme
+
+p_mis3 <- ggplot(loc_data_misclassification[loc_data_misclassification$image == "Image 3",], aes(x = x, y = y)) + 
+  geom_point() + 
+  ggtitle("Misclassified points in image3") + 
+  blank_theme
+
+grid.arrange(p_mis1,p_mis2, p_mis3, nrow = 1)
+
+```
+
+
+
+```{r Misclassification2,echo=FALSE, fig=TRUE, message=FALSE, warning=FALSE, cache = TRUE, fig.height=4, fig.width=12, fig.align="center", fig.pos = "H"}
+
+p_heatmap_NDAI <- ggplot(loc_data_misclassification, aes(x=x, y=y, color = NDAI)) + 
+  geom_point() + 
+  ggtitle("Heatmap for misclassified NDAI") +
+  blank_theme
+
+min_mis_NDAI <- min(loc_data_misclassification$NDAI)
+max_mis_NDAI <- max(loc_data_misclassification$NDAI)
+p_density_NDAI <- ggplot(image, aes(NDAI)) +
+    geom_density()+
+    ggtitle("Range of NDAI in misclassified data") + 
+    geom_vline(aes(xintercept=min_mis_NDAI, linetype="dashed"), color="blue") + 
+        geom_vline(aes(xintercept=max_mis_NDAI, linetype="dashed"), color="blue") 
+
+grid.arrange(p_heatmap_NDAI,p_density_NDAI, nrow = 1)
+```
+
+
+## Prediction on Unlabeled Data
+
+Here I use our best fit model (Random Forest) to predict the unlabeled observation data and then combine the predicted data with the labeled ones and plot the pixel-level three image data to distinguish clouds from non-clouds. Figure \ref{fig:unlabeled} shows the results of classification, compared with Figure \ref{fig:eda1}, we can see that the white part in Figure \ref{fig:eda1} are classificied as either cloud or no cloud in Figure \ref{fig:unlabeled}. We can see clear patterns in our figure, which means our classification for unlabeled area are reasonable.
+
+```{r unlabeled, echo=FALSE, message=FALSE, warning=FALSE, fig=TRUE, cache = TRUE, fig.height=4, fig.width=12, fig.align="center", fig.cap = "Plot of Expert Pixel-level Classification", fig.pos = "H"}
+# separate label and unlabeled data
+image1_unlabel <- image1[image1$label == 0,]
+image2_unlabel <- image2[image2$label == 0,]
+image3_unlabel <- image3[image3$label == 0,]
+
+image1_label <- image1[image1$label != 0,]
+image2_label <- image2[image2$label != 0,]
+image3_label <- image3[image3$label != 0,]
+image1_label$label[image1_label$label == -1] <- 0
+image2_label$label[image2_label$label == -1] <- 0
+image3_label$label[image3_label$label == -1] <- 0
+
+# prediction based on RF
+image1_unlabel$label <- predict(rf_fit, image1_unlabel)
+image2_unlabel$label <- predict(rf_fit, image2_unlabel)
+image3_unlabel$label <- predict(rf_fit, image3_unlabel)
+
+# combine label and unlabeled data
+image1_new <- rbind(image1_label, image1_unlabel)
+image2_new <- rbind(image2_label, image2_unlabel)
+image3_new <- rbind(image3_label, image3_unlabel)
+
+image1_new$image <- "Image 1"
+image2_new$image <- "Image 2"
+image3_new$image <- "Image 3"
+
+image_new <- rbind(image1_new, image2_new, image3_new)
+
+ggplot(image_new) + 
+  geom_point(aes(x = x, y = y, color = factor(label))) +
+  scale_color_discrete(name = "Expert label", labels = c("No cloud", "Cloud")) + 
+  theme_bw() + 
+  theme(panel.grid = element_line(size = 0)) + facet_grid(.~image)
+
+```
+
+
+# Conclusion
+
+Running six models to classify the data, we found that each model had some pros and cons. Some were simpler to compute but this came with the loss in prediction accuracy like in case of logistic regression. Some models were accurate but missed interpretability as in the case of neural networks. Some like logistic regression were best measured by goodness of fit parameters in classical statistics, others like random forest and neural networks used prediction accuracy measures that are followed in the modern statistics or machine learning. Most models quite accurately predicted the areas of cloud from the non cloud. Hence, we are confident about our final model to predict the clouds on new images satisfactorily. 
+
